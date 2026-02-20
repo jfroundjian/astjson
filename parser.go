@@ -5,15 +5,18 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/wundergraph/astjson/fastfloat"
 	"github.com/wundergraph/go-arena"
 )
 
+// ParseError wraps a JSON parsing error.
 type ParseError struct {
 	Err error
 }
 
+// Error returns the error message. Returns an empty string if p is nil.
 func (p *ParseError) Error() string {
 	if p == nil {
 		return ""
@@ -21,6 +24,7 @@ func (p *ParseError) Error() string {
 	return p.Err.Error()
 }
 
+// NewParseError wraps err in a ParseError. Returns nil if err is nil.
 func NewParseError(err error) *ParseError {
 	if err == nil {
 		return nil
@@ -32,6 +36,12 @@ func NewParseError(err error) *ParseError {
 // Parser parses JSON.
 //
 // Parser may be re-used for subsequent parsing.
+//
+// Parser supports two allocation modes: heap mode (Parse, ParseBytes) where
+// all values are heap-allocated and GC-managed, and arena mode
+// (ParseWithArena, ParseBytesWithArena) where all values and their backing
+// data are allocated on a caller-provided arena. See the package
+// documentation for details on GC safety.
 //
 // Parser cannot be used from concurrent goroutines.
 // Use per-goroutine parsers or ParserPool instead.
@@ -47,7 +57,20 @@ func (p *Parser) Parse(s string) (*Value, error) {
 	return p.parse(nil, s)
 }
 
+// ParseWithArena parses s containing JSON, allocating all values on the arena.
+//
+// The input string s is copied onto the arena before parsing, so the caller
+// may drop references to s immediately after this call returns. All parsed
+// Values, their string data, object keys, and array backing slices live
+// entirely in arena memory, making the result independent of the GC.
+//
+// The returned value is valid for the lifetime of the arena.
+//
+// When a is nil, behaves identically to Parse (heap allocation).
 func (p *Parser) ParseWithArena(a arena.Arena, s string) (*Value, error) {
+	if a != nil {
+		s = arenaString(a, s)
+	}
 	return p.parse(a, s)
 }
 
@@ -60,8 +83,26 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 	return p.parse(nil, b2s(b))
 }
 
+// ParseBytesWithArena parses b containing JSON, allocating all values on the
+// arena.
+//
+// The input bytes b are copied onto the arena before parsing, so the caller
+// may reuse or discard b immediately after this call returns. All parsed
+// Values, their string data, object keys, and array backing slices live
+// entirely in arena memory, making the result independent of the GC.
+//
+// The returned value is valid for the lifetime of the arena.
+//
+// When a is nil, behaves identically to ParseBytes (heap allocation). In that
+// case the caller must not modify b while the returned Value is in use, as it
+// may reference b's underlying memory via zero-copy conversion.
 func (p *Parser) ParseBytesWithArena(a arena.Arena, b []byte) (*Value, error) {
-	return p.parse(a, b2s(b))
+	if a != nil {
+		ab := arena.AllocateSlice[byte](a, len(b), len(b))
+		copy(ab, b)
+		return p.parse(a, b2s(ab))
+	}
+	return p.parse(nil, b2s(b))
 }
 
 func (p *Parser) parse(a arena.Arena, s string) (*Value, error) {
@@ -267,6 +308,8 @@ func parseObject(a arena.Arena, s string, depth int) (*Value, string, error) {
 		if err != nil {
 			return nil, s, fmt.Errorf("cannot parse object key: %s", err)
 		}
+		kv.k = unescapeStringBestEffort(a, kv.k)
+		kv.keyUnescaped = true
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != ':' {
 			return nil, s, fmt.Errorf("missing ':' after object key")
@@ -411,7 +454,9 @@ func unescapeStringBestEffort(a arena.Arena, s string) string {
 			}
 			s = s[4:]
 			if !utf16.IsSurrogate(rune(x)) {
-				b = arena.SliceAppend(a, b, []byte(string(rune(x)))...)
+				var buf [utf8.UTFMax]byte
+				n := utf8.EncodeRune(buf[:], rune(x))
+				b = arena.SliceAppend(a, b, buf[:n]...)
 				break
 			}
 
@@ -429,7 +474,9 @@ func unescapeStringBestEffort(a arena.Arena, s string) string {
 				break
 			}
 			r := utf16.DecodeRune(rune(x), rune(x1))
-			b = arena.SliceAppend(a, b, []byte(string(r))...)
+			var buf [utf8.UTFMax]byte
+			rn := utf8.EncodeRune(buf[:], r)
+			b = arena.SliceAppend(a, b, buf[:rn]...)
 			s = s[6:]
 		default:
 			// Unknown escape sequence. Just store it unchanged.
@@ -574,11 +621,9 @@ func (o *Object) getKV(a arena.Arena) *kv {
 	return o.kvs[len(o.kvs)-1]
 }
 
-// unescapeKey unescapes a specific key if it hasn't been unescaped yet.
+// unescapeKey unescapes a specific key.
+// Callers must check kv.keyUnescaped before calling.
 func (o *Object) unescapeKey(a arena.Arena, kv *kv) {
-	if kv.keyUnescaped {
-		return
-	}
 	kv.k = unescapeStringBestEffort(a, kv.k)
 	kv.keyUnescaped = true
 }
@@ -594,25 +639,12 @@ func (o *Object) Len() int {
 //
 // The returned value is valid until Parse is called on the Parser returned o.
 func (o *Object) Get(key string) *Value {
-
 	if o == nil {
 		return nil
 	}
-
-	// Fast path - try searching for the key without unescaping if the key doesn't contain escapes
-	if strings.IndexByte(key, '\\') < 0 {
-		for _, kv := range o.kvs {
-			if !kv.keyUnescaped && kv.k == key {
-				return kv.v
-			}
-		}
-	}
-
-	// Slow path - unescape keys as needed and search
+	// Keys are always pre-unescaped during parsing and Object.Set,
+	// so direct comparison is sufficient.
 	for _, kv := range o.kvs {
-		if !kv.keyUnescaped {
-			o.unescapeKey(nil, kv)
-		}
 		if kv.k == key {
 			return kv.v
 		}
@@ -628,11 +660,8 @@ func (o *Object) Visit(f func(key []byte, v *Value)) {
 	if o == nil {
 		return
 	}
-
+	// Keys are always pre-unescaped during parsing and Object.Set.
 	for _, kv := range o.kvs {
-		if !kv.keyUnescaped {
-			o.unescapeKey(nil, kv)
-		}
 		f(s2b(kv.k), kv.v)
 	}
 }
@@ -846,11 +875,7 @@ func (v *Value) GetInt(keys ...string) int {
 		return 0
 	}
 	n := fastfloat.ParseInt64BestEffort(v.s)
-	nn := int(n)
-	if int64(nn) != n {
-		return 0
-	}
-	return nn
+	return int(n)
 }
 
 // GetUint returns uint value by the given keys path.
@@ -864,11 +889,7 @@ func (v *Value) GetUint(keys ...string) uint {
 		return 0
 	}
 	n := fastfloat.ParseUint64BestEffort(v.s)
-	nn := uint(n)
-	if uint64(nn) != n {
-		return 0
-	}
-	return nn
+	return uint(n)
 }
 
 // GetInt64 returns int64 value by the given keys path.
@@ -982,11 +1003,7 @@ func (v *Value) Int() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	nn := int(n)
-	if int64(nn) != n {
-		return 0, fmt.Errorf("number %q doesn't fit int", v.s)
-	}
-	return nn, nil
+	return int(n), nil
 }
 
 // Uint returns the underlying JSON uint for the v.
@@ -1000,11 +1017,7 @@ func (v *Value) Uint() (uint, error) {
 	if err != nil {
 		return 0, err
 	}
-	nn := uint(n)
-	if uint64(nn) != n {
-		return 0, fmt.Errorf("number %q doesn't fit uint", v.s)
-	}
-	return nn, nil
+	return uint(n), nil
 }
 
 // Int64 returns the underlying JSON int64 for the v.

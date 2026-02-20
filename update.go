@@ -2,7 +2,6 @@ package astjson
 
 import (
 	"strconv"
-	"strings"
 
 	"github.com/wundergraph/go-arena"
 )
@@ -12,23 +11,12 @@ func (o *Object) Del(key string) {
 	if o == nil {
 		return
 	}
-	if strings.IndexByte(key, '\\') < 0 {
-		// Fast path - try searching for the key without unescaping
-		for i, kv := range o.kvs {
-			if !kv.keyUnescaped && kv.k == key {
-				o.kvs = append(o.kvs[:i], o.kvs[i+1:]...)
-				return
-			}
-		}
-	}
-
-	// Slow path - unescape keys as needed and search
+	// Keys are always pre-unescaped during parsing and Object.Set,
+	// so direct comparison is sufficient.
 	for i, kv := range o.kvs {
-		if !kv.keyUnescaped {
-			o.unescapeKey(nil, kv)
-		}
 		if kv.k == key {
 			o.kvs = append(o.kvs[:i], o.kvs[i+1:]...)
+			o.kvs[:len(o.kvs)+1][len(o.kvs)] = nil // clear hidden slot for GC
 			return
 		}
 	}
@@ -49,12 +37,20 @@ func (v *Value) Del(key string) {
 			return
 		}
 		v.a = append(v.a[:n], v.a[n+1:]...)
+		v.a[:len(v.a)+1][len(v.a)] = nil // clear hidden slot for GC
 	}
 }
 
 // Set sets (key, value) entry in the o.
 //
 // The value must be unchanged during o lifetime.
+//
+// GC safety: when o is arena-allocated (a is non-nil), value must also be
+// arena-allocated from the same arena, or be a package-level singleton.
+// Storing a heap-allocated *Value in arena memory is unsafe because the GC
+// does not trace pointers within arena buffers. Use [DeepCopy] to copy a
+// heap-allocated value onto the arena before passing it here. See the package
+// documentation section "Mixing Arena and Heap Values" for details.
 func (o *Object) Set(a arena.Arena, key string, value *Value) {
 	if o == nil {
 		return
@@ -76,7 +72,7 @@ func (o *Object) Set(a arena.Arena, key string, value *Value) {
 
 	// Add new entry.
 	kv := o.getKV(a)
-	kv.k = key
+	kv.k = arenaString(a, key)
 	kv.v = value
 	kv.keyUnescaped = true // New keys are already unescaped since they come from user input
 }
@@ -104,6 +100,11 @@ func (v *Value) Set(a arena.Arena, key string, value *Value) {
 // SetArrayItem sets the value in the array v at idx position.
 //
 // The value must be unchanged during v lifetime.
+//
+// GC safety: when v is arena-allocated (a is non-nil), value must also be
+// arena-allocated from the same arena, or be a package-level singleton.
+// Use [DeepCopy] to copy a heap-allocated value onto the arena before passing
+// it here. See the package documentation section "Mixing Arena and Heap Values".
 func (v *Value) SetArrayItem(a arena.Arena, idx int, value *Value) {
 	if v == nil || v.t != TypeArray {
 		return

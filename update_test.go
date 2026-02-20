@@ -110,7 +110,7 @@ func TestValueDelSet(t *testing.T) {
 func TestValue_AppendArrayItems(t *testing.T) {
 	left := MustParse(`[1,2,3]`)
 	right := MustParse(`[4,5,6]`)
-	left.AppendArrayItems(right)
+	left.AppendArrayItems(nil, right)
 	if len(left.GetArray()) != 6 {
 		t.Fatalf("unexpected length; got %d; want %d", len(left.GetArray()), 6)
 	}
@@ -604,5 +604,27 @@ func TestObjectDelWithNilArena(t *testing.T) {
 	// Verify the remaining key
 	if o.Get("x") == nil {
 		t.Fatalf("expected key 'x' to still exist")
+	}
+}
+
+func TestObjectSetWithUnescapedKey(t *testing.T) {
+	// Construct an object with a key that hasn't been unescaped yet.
+	// When Set iterates over existing keys, it should call unescapeKey.
+	a := arena.NewMonotonicArena()
+	o := &Object{}
+	entry := &kv{
+		k:            `hello`,
+		v:            valueNull,
+		keyUnescaped: false,
+	}
+	o.kvs = append(o.kvs, entry)
+
+	o.Set(a, "other", MustParse(`1`))
+
+	if !o.kvs[0].keyUnescaped {
+		t.Fatalf("expected key to be unescaped after Set")
+	}
+	if o.Len() != 2 {
+		t.Fatalf("expected 2 keys, got %d", o.Len())
 	}
 }
